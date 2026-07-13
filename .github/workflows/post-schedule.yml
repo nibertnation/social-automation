@@ -1,0 +1,36 @@
+name: Post to Menopause Clarity
+
+on:
+  schedule:
+    - cron: '*/30 * * * *'
+  workflow_dispatch:
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: pip install requests
+
+      - name: Run posting engine
+        env:
+          PAGE_ID: ${{ secrets.PAGE_ID }}
+          IG_USER_ID: ${{ secrets.IG_USER_ID }}
+          PAGE_ACCESS_TOKEN: ${{ secrets.PAGE_ACCESS_TOKEN }}
+        run: python post_engine.py
+
+      - name: Commit updated schedule file if changed
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add schedule_menopause_clarity.csv
+          git diff --quiet && git diff --staged --quiet || git commit -m "Update posted status [skip ci]"
+          git push
