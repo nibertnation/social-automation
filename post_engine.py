@@ -24,13 +24,33 @@ instagram,https://storage.googleapis.com/yourbucket/img3.jpg,"Reclaim your power
 import csv
 import os
 import sys
+import time
 from datetime import datetime
 
 import requests
 
-import config_menopause_clarity as cfg
+# Try to read credentials from environment variables first (this is how
+# GitHub Actions provides the Secrets you configured). If they're not set
+# (e.g. running locally on your laptop), fall back to the local config file.
+PAGE_ID = os.environ.get("PAGE_ID")
+IG_USER_ID = os.environ.get("IG_USER_ID")
+PAGE_ACCESS_TOKEN = os.environ.get("PAGE_ACCESS_TOKEN")
+GRAPH_API_VERSION = os.environ.get("GRAPH_API_VERSION", "v25.0")
+SCHEDULE_CSV = os.environ.get("SCHEDULE_CSV", "schedule_menopause_clarity.csv")
 
-GRAPH_URL = f"https://graph.facebook.com/{cfg.GRAPH_API_VERSION}"
+if not PAGE_ID or not IG_USER_ID or not PAGE_ACCESS_TOKEN:
+    try:
+        import config_menopause_clarity as cfg
+        PAGE_ID = PAGE_ID or cfg.PAGE_ID
+        IG_USER_ID = IG_USER_ID or cfg.IG_USER_ID
+        PAGE_ACCESS_TOKEN = PAGE_ACCESS_TOKEN or cfg.PAGE_ACCESS_TOKEN
+        GRAPH_API_VERSION = cfg.GRAPH_API_VERSION
+        SCHEDULE_CSV = cfg.SCHEDULE_CSV
+    except ImportError:
+        print("ERROR: No credentials found in environment variables or config file.")
+        sys.exit(1)
+
+GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 
 def log(msg):
@@ -41,11 +61,11 @@ def log(msg):
 def post_to_facebook(image_url, caption):
     """Posts a photo with caption to the Facebook Page. Returns the post ID or None."""
     resp = requests.post(
-        f"{GRAPH_URL}/{cfg.PAGE_ID}/photos",
+        f"{GRAPH_URL}/{PAGE_ID}/photos",
         data={
             "url": image_url,
             "caption": caption,
-            "access_token": cfg.PAGE_ACCESS_TOKEN,
+            "access_token": PAGE_ACCESS_TOKEN,
         },
     )
     data = resp.json()
@@ -61,11 +81,11 @@ def post_to_instagram(image_url, caption):
     """Two-step Instagram publish: create container, then publish it. Returns media ID or None."""
     # Step 1: create container
     container_resp = requests.post(
-        f"{GRAPH_URL}/{cfg.IG_USER_ID}/media",
+        f"{GRAPH_URL}/{IG_USER_ID}/media",
         data={
             "image_url": image_url,
             "caption": caption,
-            "access_token": cfg.PAGE_ACCESS_TOKEN,
+            "access_token": PAGE_ACCESS_TOKEN,
         },
     )
     container_data = container_resp.json()
@@ -75,19 +95,29 @@ def post_to_instagram(image_url, caption):
 
     creation_id = container_data["id"]
 
-    # Step 2: publish container
-    publish_resp = requests.post(
-        f"{GRAPH_URL}/{cfg.IG_USER_ID}/media_publish",
-        data={
-            "creation_id": creation_id,
-            "access_token": cfg.PAGE_ACCESS_TOKEN,
-        },
-    )
-    publish_data = publish_resp.json()
-    if "id" in publish_data:
-        log(f"  Instagram post succeeded: {publish_data}")
-        return publish_data["id"]
-    else:
+    # Step 2: publish container -- Instagram sometimes needs a few seconds to
+    # finish processing the image before it can be published, so retry a few times.
+    max_attempts = 5
+    wait_seconds = 5
+    for attempt in range(1, max_attempts + 1):
+        publish_resp = requests.post(
+            f"{GRAPH_URL}/{IG_USER_ID}/media_publish",
+            data={
+                "creation_id": creation_id,
+                "access_token": PAGE_ACCESS_TOKEN,
+            },
+        )
+        publish_data = publish_resp.json()
+        if "id" in publish_data:
+            log(f"  Instagram post succeeded: {publish_data}")
+            return publish_data["id"]
+
+        error_subcode = publish_data.get("error", {}).get("error_subcode")
+        if error_subcode == 2207027 and attempt < max_attempts:
+            log(f"  Instagram media still processing, waiting {wait_seconds}s (attempt {attempt}/{max_attempts})...")
+            time.sleep(wait_seconds)
+            continue
+
         log(f"  Instagram publish FAILED: {publish_data}")
         return None
 
@@ -97,8 +127,8 @@ def check_token_expiry():
     resp = requests.get(
         f"{GRAPH_URL}/debug_token",
         params={
-            "input_token": cfg.PAGE_ACCESS_TOKEN,
-            "access_token": cfg.PAGE_ACCESS_TOKEN,
+            "input_token": PAGE_ACCESS_TOKEN,
+            "access_token": PAGE_ACCESS_TOKEN,
         },
     )
     data = resp.json()
@@ -114,8 +144,8 @@ def check_token_expiry():
 
 
 def run():
-    if not os.path.exists(cfg.SCHEDULE_CSV):
-        log(f"Schedule file not found: {cfg.SCHEDULE_CSV}")
+    if not os.path.exists(SCHEDULE_CSV):
+        log(f"Schedule file not found: {SCHEDULE_CSV}")
         sys.exit(1)
 
     check_token_expiry()
@@ -124,7 +154,7 @@ def run():
     rows = []
     made_a_post = False
 
-    with open(cfg.SCHEDULE_CSV, newline="", encoding="utf-8") as f:
+    with open(SCHEDULE_CSV, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames
         for row in reader:
@@ -164,7 +194,7 @@ def run():
             log("  One or more platforms failed -- leaving marked as NOT posted so it retries next run.")
 
     if made_a_post:
-        with open(cfg.SCHEDULE_CSV, "w", newline="", encoding="utf-8") as f:
+        with open(SCHEDULE_CSV, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(rows)
