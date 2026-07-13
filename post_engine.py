@@ -9,13 +9,15 @@ Run this on a timer (e.g. every 30 minutes via Task Scheduler / cron).
 Each run does one pass: check schedule, post what's due, exit.
 
 CSV FORMAT (schedule_menopause_clarity.csv):
-platform,image_url,caption,post_time,posted
-both,https://storage.googleapis.com/yourbucket/img1.jpg,"Real talk about hot flashes",2026-07-14 09:00,False
-facebook,https://storage.googleapis.com/yourbucket/img2.jpg,"New blog post is up",2026-07-14 13:00,False
-instagram,https://storage.googleapis.com/yourbucket/img3.jpg,"Reclaim your power",2026-07-14 17:00,False
+platform,media_type,image_url,caption,post_time,posted
+both,image,https://storage.googleapis.com/yourbucket/img1.jpg,"Real talk about hot flashes",2026-07-14 09:00,False
+facebook,video,https://storage.googleapis.com/yourbucket/reel1.mp4,"New reel is up",2026-07-14 13:00,False
+instagram,image,https://storage.googleapis.com/yourbucket/img3.jpg,"Reclaim your power",2026-07-14 17:00,False
 
 - platform: "facebook", "instagram", or "both"
-- image_url: must be a PUBLIC url (Instagram cannot use local files)
+- media_type: "image" or "video" -- video posts as a Facebook video / Instagram Reel
+- image_url: must be a PUBLIC url (Instagram/Facebook cannot use local files).
+  Despite the column name, this holds video URLs too when media_type is "video".
 - caption: text for the post
 - post_time: format YYYY-MM-DD HH:MM (24-hour), in your local time
 - posted: True or False -- the script updates this automatically
@@ -58,35 +60,82 @@ def log(msg):
     print(f"[{timestamp}] {msg}")
 
 
-def post_to_facebook(image_url, caption):
-    """Posts a photo with caption to the Facebook Page. Returns the post ID or None."""
-    resp = requests.post(
-        f"{GRAPH_URL}/{PAGE_ID}/photos",
-        data={
-            "url": image_url,
+def post_to_facebook(media_url, caption, media_type="image"):
+    """Posts a photo or video with caption to the Facebook Page. Returns the post ID or None."""
+    if media_type == "video":
+        endpoint = f"{GRAPH_URL}/{PAGE_ID}/videos"
+        data = {
+            "file_url": media_url,
+            "description": caption,
+            "access_token": PAGE_ACCESS_TOKEN,
+        }
+    else:
+        endpoint = f"{GRAPH_URL}/{PAGE_ID}/photos"
+        data = {
+            "url": media_url,
             "caption": caption,
             "access_token": PAGE_ACCESS_TOKEN,
-        },
-    )
-    data = resp.json()
-    if "id" in data or "post_id" in data:
-        log(f"  Facebook post succeeded: {data}")
-        return data.get("post_id", data.get("id"))
+        }
+
+    resp = requests.post(endpoint, data=data)
+    result = resp.json()
+    if "id" in result or "post_id" in result:
+        log(f"  Facebook post succeeded: {result}")
+        return result.get("post_id", result.get("id"))
     else:
-        log(f"  Facebook post FAILED: {data}")
+        log(f"  Facebook post FAILED: {result}")
         return None
 
 
-def post_to_instagram(image_url, caption):
+def wait_for_instagram_container_ready(creation_id, max_wait_seconds=280, poll_interval=10):
+    """Polls Instagram's container status until it's FINISHED (ready to
+    publish) or ERROR, or until max_wait_seconds is exceeded. Videos/Reels
+    take real processing time (often 30s-3min+), much longer than photos,
+    so this checks the actual status instead of just guessing with a fixed
+    retry count."""
+    elapsed = 0
+    while elapsed < max_wait_seconds:
+        status_resp = requests.get(
+            f"{GRAPH_URL}/{creation_id}",
+            params={
+                "fields": "status_code",
+                "access_token": PAGE_ACCESS_TOKEN,
+            },
+        )
+        status_data = status_resp.json()
+        status_code = status_data.get("status_code")
+
+        if status_code == "FINISHED":
+            return True
+        if status_code == "ERROR":
+            log(f"  Instagram media processing failed: {status_data}")
+            return False
+
+        log(f"  Instagram media still processing (status: {status_code}), "
+            f"waiting {poll_interval}s...")
+        time.sleep(poll_interval)
+        elapsed += poll_interval
+
+    log("  Instagram media took too long to process -- giving up for this run, will retry next time.")
+    return False
+
+
+def post_to_instagram(media_url, caption, media_type="image"):
     """Two-step Instagram publish: create container, then publish it. Returns media ID or None."""
     # Step 1: create container
+    container_data_payload = {
+        "caption": caption,
+        "access_token": PAGE_ACCESS_TOKEN,
+    }
+    if media_type == "video":
+        container_data_payload["video_url"] = media_url
+        container_data_payload["media_type"] = "REELS"
+    else:
+        container_data_payload["image_url"] = media_url
+
     container_resp = requests.post(
         f"{GRAPH_URL}/{IG_USER_ID}/media",
-        data={
-            "image_url": image_url,
-            "caption": caption,
-            "access_token": PAGE_ACCESS_TOKEN,
-        },
+        data=container_data_payload,
     )
     container_data = container_resp.json()
     if "id" not in container_data:
@@ -95,8 +144,14 @@ def post_to_instagram(image_url, caption):
 
     creation_id = container_data["id"]
 
-    # Step 2: publish container -- Instagram sometimes needs a few seconds to
-    # finish processing the image before it can be published, so retry a few times.
+    # Videos need to finish processing before they can be published --
+    # check status explicitly rather than guessing with fixed retries.
+    if media_type == "video":
+        if not wait_for_instagram_container_ready(creation_id):
+            return None
+
+    # Step 2: publish container -- photos sometimes need a few extra seconds
+    # even after creation, so still retry a few times here too.
     max_attempts = 5
     wait_seconds = 5
     for attempt in range(1, max_attempts + 1):
@@ -157,7 +212,10 @@ def run():
     with open(SCHEDULE_CSV, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames
+        if fieldnames and "media_type" not in fieldnames:
+            fieldnames = list(fieldnames) + ["media_type"]
         for row in reader:
+            row.setdefault("media_type", "image")
             rows.append(row)
 
     for row in rows:
@@ -174,17 +232,18 @@ def run():
             continue  # not due yet
 
         platform = row["platform"].strip().lower()
+        media_type = row.get("media_type", "image").strip().lower() or "image"
         image_url = row["image_url"].strip()
         caption = row["caption"].strip()
 
-        log(f"Posting scheduled for {post_time} -> platform: {platform}")
+        log(f"Posting scheduled for {post_time} -> platform: {platform}, type: {media_type}")
 
         success = True
         if platform in ("facebook", "both"):
-            if not post_to_facebook(image_url, caption):
+            if not post_to_facebook(image_url, caption, media_type=media_type):
                 success = False
         if platform in ("instagram", "both"):
-            if not post_to_instagram(image_url, caption):
+            if not post_to_instagram(image_url, caption, media_type=media_type):
                 success = False
 
         if success:
