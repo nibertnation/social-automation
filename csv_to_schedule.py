@@ -9,15 +9,23 @@ from google.oauth2 import service_account
 # -------------------------------------------------------------------
 # CSV Converter: Weekly Scheduler -> post_engine.py format (public GCS URLs)
 # -------------------------------------------------------------------
-# Uploads each finished image/banner to a PUBLIC Google Cloud Storage bucket
-# and writes out schedule_menopause_clarity.csv in the exact format
-# post_engine.py reads (platform, image_url, caption, post_time, posted).
+# Uploads each finished image/banner/reel to a PUBLIC Google Cloud Storage
+# bucket and writes out schedule_menopause_clarity.csv in the format
+# post_engine.py reads (platform, media_type, image_url, caption, post_time,
+# posted).
 #
 # This replaces the old Publer-based workflow -- posts now go out directly
 # via post_engine.py instead of being imported into Publer.
 #
-# NOTE: Reel rows are intentionally skipped -- those are scheduled separately.
-# Only "image" and "banner" Asset_Type rows are converted.
+# DAILY INSTAGRAM SAFETY CAP: Instagram enforces a hard limit of 25 published
+# posts per rolling 24-hour period. To leave headroom for content types this
+# script doesn't handle yet (e.g. "creative posts"), this script automatically
+# caps how many posts per calendar day get sent to Instagram at
+# MAX_INSTAGRAM_POSTS_PER_DAY. Once that day's count is reached, any
+# additional posts for that same day are automatically routed to
+# Facebook-only instead of being skipped -- nothing is lost, it just won't
+# double-post to Instagram past the safe limit. You don't need to manually
+# tag rows for this -- it's automatic, counting in the order rows appear.
 
 INPUT_CSV = "schedule.csv"
 OUTPUT_CSV = "schedule_menopause_clarity.csv"
@@ -25,16 +33,23 @@ OUTPUT_CSV = "schedule_menopause_clarity.csv"
 # Where generate_and_process.py wrote the finished files.
 IMAGE_FINAL_DIR = "generated_images"
 BANNER_FINAL_DIR = "generated_banners"
+REEL_FINAL_DIR = "generated_reels"
+REEL_RAW_DIR = "raw_generated_reels"
 
 # --- Google Cloud Storage config -------------------------------------------
 SERVICE_ACCOUNT_FILE = "service_account.json"
 GCS_BUCKET_NAME = "menopause-clarity-images"
 
-# Both Facebook and Instagram, since Menopause Clarity posts to both.
-# Change to "facebook" or "instagram" per-row in schedule.csv if you ever
-# want a post to go to only one platform (add a "Platform" column and
-# read it below, same pattern as the other columns).
+# Both Facebook and Instagram by default, since Menopause Clarity normally
+# posts to both. Add a "Platform" column to schedule.csv (values: "both",
+# "facebook", or "instagram") to manually force a specific row -- otherwise
+# it falls back to this default AND to the automatic daily cap below.
 DEFAULT_PLATFORM = "both"
+
+# Leaves room for ~6 additional daily items (e.g. manually-posted "creative
+# posts") that aren't part of this automated pipeline yet, while still
+# staying under Instagram's real 25/day ceiling.
+MAX_INSTAGRAM_POSTS_PER_DAY = 19
 
 SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
@@ -52,10 +67,10 @@ def get_storage_client():
     return storage.Client(credentials=creds, project=creds.project_id)
 
 
-def find_local_file(filename):
-    """Looks for the finished file in either output folder from
-    generate_and_process.py."""
-    for folder in (IMAGE_FINAL_DIR, BANNER_FINAL_DIR):
+def find_local_file(filename, is_reel=False):
+    """Looks for the finished file in the appropriate output folder(s)."""
+    folders = (REEL_FINAL_DIR, REEL_RAW_DIR) if is_reel else (IMAGE_FINAL_DIR, BANNER_FINAL_DIR)
+    for folder in folders:
         candidate = os.path.join(folder, filename)
         if os.path.exists(candidate):
             return candidate
@@ -118,6 +133,11 @@ def convert_schedule(input_file, output_file, bucket_name):
     skipped_count = 0
     processed_count = 0
     failed_count = 0
+    downgraded_count = 0
+
+    # Tracks how many posts have been routed to Instagram so far, per
+    # calendar date, so the daily cap can be enforced automatically.
+    instagram_count_by_date = {}
 
     try:
         with open(input_file, mode="r", encoding="utf-8") as infile:
@@ -130,31 +150,52 @@ def convert_schedule(input_file, output_file, bucket_name):
                 filename = row.get("Image_Filename", "").strip()
                 date_val = row.get("Date", "").strip()
                 time_val = row.get("Time", "").strip()
+                platform = row.get("Platform", "").strip().lower() or DEFAULT_PLATFORM
 
-                if asset_type not in ["image", "banner"]:
-                    # Reels are scheduled separately -- skip on purpose.
+                is_reel = asset_type == "reel"
+                if asset_type not in ["image", "banner", "reel"]:
                     skipped_count += 1
                     continue
 
-                local_path = find_local_file(filename)
+                local_path = find_local_file(filename, is_reel=is_reel)
                 if not local_path:
                     print(f"⚠️  '{filename}' not found -- did generate_and_process.py finish?")
                     failed_count += 1
                     continue
+
+                # Enforce the daily Instagram cap automatically, regardless
+                # of what the Platform column says.
+                wants_instagram = platform in ("both", "instagram")
+                if wants_instagram:
+                    day_count = instagram_count_by_date.get(date_val, 0)
+                    if day_count >= MAX_INSTAGRAM_POSTS_PER_DAY:
+                        if platform == "instagram":
+                            print(f"⚠️  Row {row_num}: daily Instagram cap reached for {date_val} -- "
+                                  f"skipping this Instagram-only row entirely.")
+                            skipped_count += 1
+                            continue
+                        else:
+                            platform = "facebook"
+                            downgraded_count += 1
+                            print(f"⤵️  Row {row_num}: daily Instagram cap reached for {date_val} -- "
+                                  f"routing to Facebook only.")
+                    else:
+                        instagram_count_by_date[date_val] = day_count + 1
 
                 url = upload_and_get_public_url(bucket, local_path)
                 post_time = format_post_time(date_val, time_val)
                 full_caption = build_caption_text(caption, hashtags)
 
                 rows.append({
-                    "platform": DEFAULT_PLATFORM,
+                    "platform": platform,
+                    "media_type": "video" if is_reel else "image",
                     "image_url": url,
                     "caption": full_caption,
                     "post_time": post_time,
                     "posted": "False",
                 })
                 processed_count += 1
-                print(f"✅ Row {row_num}: {asset_type} -> {filename}")
+                print(f"✅ Row {row_num}: {asset_type} -> {filename} [{platform}]")
 
         if rows:
             # If schedule_menopause_clarity.csv already has rows (e.g. some
@@ -165,8 +206,13 @@ def convert_schedule(input_file, output_file, bucket_name):
                 with open(output_file, "r", newline="", encoding="utf-8") as f:
                     existing_rows = list(csv.DictReader(f))
 
+            # Fill in media_type="image" for any pre-existing rows from before
+            # this field existed, so the CSV stays consistent.
+            for r in existing_rows:
+                r.setdefault("media_type", "image")
+
             all_rows = existing_rows + rows
-            fieldnames = ["platform", "image_url", "caption", "post_time", "posted"]
+            fieldnames = ["platform", "media_type", "image_url", "caption", "post_time", "posted"]
 
             with open(output_file, mode="w", encoding="utf-8", newline="") as outfile:
                 writer = csv.DictWriter(outfile, fieldnames=fieldnames)
@@ -175,7 +221,8 @@ def convert_schedule(input_file, output_file, bucket_name):
 
             print(f"\n✅ Conversion complete!")
             print(f"   Added: {processed_count} new rows")
-            print(f"   Skipped (reels/manual): {skipped_count} rows")
+            print(f"   Routed to Facebook-only (daily IG cap): {downgraded_count} rows")
+            print(f"   Skipped (unsupported type / missing file / IG cap): {skipped_count} rows")
             if failed_count:
                 print(f"   ⚠️  Failed (missing local file): {failed_count} rows")
             print(f"   Output file: {output_file} ({len(all_rows)} total rows)")
