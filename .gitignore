@@ -1,0 +1,6 @@
+service_account.json
+schedule.csv
+generated_*/
+raw_generated/
+raw_generated_reels/
+__pycache__/
