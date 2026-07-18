@@ -126,6 +126,7 @@ def post_to_instagram(media_url, caption, media_type="image"):
     container_data_payload = {
         "caption": caption,
         "access_token": PAGE_ACCESS_TOKEN,
+        "is_ai_generated": True,
     }
     if media_type == "video":
         container_data_payload["video_url"] = media_url
