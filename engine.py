@@ -174,11 +174,26 @@ def add_overlay_text(image, overlay_text, position="upper"):
     else:  # "upper" default
         block_top = int(TARGET_HEIGHT * 0.08)
 
+    bar_pad_x, bar_pad_y = 36, 24
+    bar_box = [
+        (TARGET_WIDTH - block_width) // 2 - bar_pad_x,
+        block_top - bar_pad_y,
+        (TARGET_WIDTH + block_width) // 2 + bar_pad_x,
+        block_top + block_height + bar_pad_y,
+    ]
+    draw.rounded_rectangle(bar_box, radius=18, fill=BAR_COLOR)
+
     outline_width = 6
     y = block_top
     for i, line in enumerate(lines):
         x = (TARGET_WIDTH - line_widths[i]) // 2
-        draw.text((x, y), line, font=font, fill=(255, 255, 255, 255), stroke_width=outline_width, stroke_fill=(0, 0, 0, 255))
+        for dx in range(-outline_width, outline_width + 1, 2):
+            for dy in range(-outline_width, outline_width + 1, 2):
+                if dx == 0 and dy == 0:
+                    continue
+                draw.text((x + dx, y + dy), line, font=font, fill=(0, 0, 0, 255))
+        draw.text((x + 8, y + 8), line, font=font, fill=(0, 0, 0, 140))
+        draw.text((x, y), line, font=font, fill=(255, 255, 255, 255))
         y += line_heights[i] + line_spacing
 
     composited = Image.alpha_composite(image, overlay_layer)
