@@ -117,8 +117,8 @@ def build_caption_text(caption, hashtags):
     hashtags = (hashtags or "").strip()
 
     if caption and hashtags:
-        return f"{caption}\n\n{hashtags}"
-    return caption or hashtags
+        return f"{caption}\n\n{hashtags}\n\nAI-Assisted"
+    return f"{caption or hashtags}\n\nAI-Assisted"
 
 
 def convert_schedule(input_file, output_file, bucket_name):
