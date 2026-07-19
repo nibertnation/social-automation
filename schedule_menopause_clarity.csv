@@ -1,1 +1,11 @@
-platform,image_url,caption,post_time,posted
+platform,media_type,image_url,caption,post_time,posted
+both,image,https://storage.googleapis.com/menopause-clarity-images/pipeline_test_001.png,"Testing our posting system tonight. If you're seeing this, it worked!
+
+#test
+
+AI-Assisted",2026-07-19 04:35,False
+both,image,https://storage.googleapis.com/menopause-clarity-images/pipeline_test_002.png,"Second test post to confirm banners work too.
+
+#test
+
+AI-Assisted",2026-07-19 04:40,False
