@@ -121,6 +121,46 @@ def build_caption_text(caption, hashtags):
     return f"{caption or hashtags}\n\nAI-Assisted"
 
 
+def dedupe_by_image_url(all_rows):
+    """Collapses rows that share the same image_url, keeping the LAST
+    occurrence of each. This is the safeguard against the recurring
+    duplicate-row problem: when schedule.csv is retimed and this script is
+    re-run, every row gets processed fresh and appended on top of the
+    existing output file. Without this, a 91-row file becomes 180 rows.
+
+    Keeping the *last* occurrence is deliberate -- the freshly-processed row
+    (appended after the existing rows) carries the corrected post_time /
+    platform from the latest run, so it should win over the stale existing
+    copy. Rows with an empty image_url are left untouched (never merged),
+    so nothing without a URL is silently dropped.
+
+    Original row order is otherwise preserved (by the position of each
+    image_url's LAST appearance)."""
+    seen_index = {}          # image_url -> index into deduped list
+    deduped = []
+    duplicates_removed = 0
+
+    for row in all_rows:
+        url = (row.get("image_url") or "").strip()
+
+        # Rows without a usable image_url can't be deduped safely -- keep
+        # every one of them as-is.
+        if not url:
+            deduped.append(row)
+            continue
+
+        if url in seen_index:
+            # Overwrite the earlier copy in place, preserving its position
+            # but taking the newer row's data.
+            deduped[seen_index[url]] = row
+            duplicates_removed += 1
+        else:
+            seen_index[url] = len(deduped)
+            deduped.append(row)
+
+    return deduped, duplicates_removed
+
+
 def convert_schedule(input_file, output_file, bucket_name):
     if not bucket_name:
         print("❌ Error: GCS_BUCKET_NAME is empty!")
@@ -212,6 +252,12 @@ def convert_schedule(input_file, output_file, bucket_name):
                 r.setdefault("media_type", "image")
 
             all_rows = existing_rows + rows
+
+            # SAFEGUARD: collapse any rows sharing the same image_url, keeping
+            # the newest (last) copy. This prevents the recurring duplicate-row
+            # problem when schedule.csv is retimed and this script is re-run.
+            all_rows, duplicates_removed = dedupe_by_image_url(all_rows)
+
             fieldnames = ["platform", "media_type", "image_url", "caption", "post_time", "posted"]
 
             with open(output_file, mode="w", encoding="utf-8", newline="") as outfile:
@@ -225,6 +271,9 @@ def convert_schedule(input_file, output_file, bucket_name):
             print(f"   Skipped (unsupported type / missing file / IG cap): {skipped_count} rows")
             if failed_count:
                 print(f"   ⚠️  Failed (missing local file): {failed_count} rows")
+            if duplicates_removed:
+                print(f"   🧹 Deduped: {duplicates_removed} duplicate image_url row(s) collapsed "
+                      f"(kept newest copy of each)")
             print(f"   Output file: {output_file} ({len(all_rows)} total rows)")
             return True
         else:
