@@ -65,7 +65,7 @@ GRAPH_URL = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
 
 
 def log(msg):
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    timestamp = datetime.now(EASTERN).replace(tzinfo=None).strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {msg}")
 
 
