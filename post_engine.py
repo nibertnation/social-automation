@@ -9,10 +9,10 @@ Run this on a timer (e.g. every 30 minutes via Task Scheduler / cron).
 Each run does one pass: check schedule, post what's due, exit.
 
 CSV FORMAT (schedule_menopause_clarity.csv):
-platform,media_type,image_url,caption,post_time,posted
-both,image,https://storage.googleapis.com/yourbucket/img1.jpg,"Real talk about hot flashes",2026-07-14 09:00,False
-facebook,video,https://storage.googleapis.com/yourbucket/reel1.mp4,"New reel is up",2026-07-14 13:00,False
-instagram,image,https://storage.googleapis.com/yourbucket/img3.jpg,"Reclaim your power",2026-07-14 17:00,False
+platform,media_type,image_url,caption,post_time,posted,fb_posted,ig_posted
+both,image,https://storage.googleapis.com/yourbucket/img1.jpg,"Real talk about hot flashes",2026-07-14 09:00,False,False,False
+facebook,video,https://storage.googleapis.com/yourbucket/reel1.mp4,"New reel is up",2026-07-14 13:00,False,False,False
+instagram,image,https://storage.googleapis.com/yourbucket/img3.jpg,"Reclaim your power",2026-07-14 17:00,False,False,False
 
 - platform: "facebook", "instagram", or "both"
 - media_type: "image" or "video" -- video posts as a Facebook video / Instagram Reel
@@ -20,7 +20,13 @@ instagram,image,https://storage.googleapis.com/yourbucket/img3.jpg,"Reclaim your
   Despite the column name, this holds video URLs too when media_type is "video".
 - caption: text for the post
 - post_time: format YYYY-MM-DD HH:MM (24-hour), in your local time
-- posted: True or False -- the script updates this automatically
+- posted: True or False -- True only once every platform this row needs has
+  succeeded. The script updates this automatically.
+- fb_posted / ig_posted: True or False -- tracks each platform independently
+  so that on platform="both" rows, a platform that already succeeded is never
+  re-posted just because the other platform failed or is still rate-limited.
+  These columns are optional in older CSVs -- missing values default to
+  False and get backfilled automatically the first time the row is touched.
 """
 
 import csv
@@ -208,15 +214,25 @@ def run():
 
     now = datetime.now()
     rows = []
-    made_a_post = False
+    made_a_change = False
 
     with open(SCHEDULE_CSV, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         fieldnames = reader.fieldnames
-        if fieldnames and "media_type" not in fieldnames:
-            fieldnames = list(fieldnames) + ["media_type"]
+        # Backfill any columns older CSVs might not have yet, same pattern
+        # as the existing media_type backfill below.
+        for extra_col in ("media_type", "fb_posted", "ig_posted"):
+            if fieldnames and extra_col not in fieldnames:
+                fieldnames = list(fieldnames) + [extra_col]
         for row in reader:
             row.setdefault("media_type", "image")
+            row.setdefault("fb_posted", "False")
+            row.setdefault("ig_posted", "False")
+            # Treat blank values (old rows that never had the column) as False too.
+            if not row.get("fb_posted", "").strip():
+                row["fb_posted"] = "False"
+            if not row.get("ig_posted", "").strip():
+                row["ig_posted"] = "False"
             rows.append(row)
 
     for row in rows:
@@ -237,23 +253,45 @@ def run():
         image_url = row["image_url"].strip()
         caption = row["caption"].strip()
 
-        log(f"Posting scheduled for {post_time} -> platform: {platform}, type: {media_type}")
+        needs_facebook = platform in ("facebook", "both")
+        needs_instagram = platform in ("instagram", "both")
+        fb_already_posted = row["fb_posted"].strip().lower() == "true"
+        ig_already_posted = row["ig_posted"].strip().lower() == "true"
 
-        success = True
-        if platform in ("facebook", "both"):
-            if not post_to_facebook(image_url, caption, media_type=media_type):
-                success = False
-        if platform in ("instagram", "both"):
-            if not post_to_instagram(image_url, caption, media_type=media_type):
-                success = False
+        log(f"Checking row scheduled for {post_time} -> platform: {platform}, type: {media_type}")
 
-        if success:
-            row["posted"] = "True"
-            made_a_post = True
+        # Only attempt each platform if it's needed AND hasn't already
+        # succeeded on a prior run. This is what prevents Facebook from
+        # getting re-posted just because Instagram failed/rate-limited.
+        if needs_facebook and not fb_already_posted:
+            if post_to_facebook(image_url, caption, media_type=media_type):
+                row["fb_posted"] = "True"
+                made_a_change = True
+            else:
+                log("  Facebook failed -- will retry Facebook next run.")
+        elif needs_facebook and fb_already_posted:
+            log("  Facebook already posted for this row -- skipping to avoid duplicate.")
+
+        if needs_instagram and not ig_already_posted:
+            if post_to_instagram(image_url, caption, media_type=media_type):
+                row["ig_posted"] = "True"
+                made_a_change = True
+            else:
+                log("  Instagram failed -- will retry Instagram next run.")
+        elif needs_instagram and ig_already_posted:
+            log("  Instagram already posted for this row -- skipping to avoid duplicate.")
+
+        # Row is fully done only once every platform it needs has succeeded.
+        fb_ok = (not needs_facebook) or row["fb_posted"].strip().lower() == "true"
+        ig_ok = (not needs_instagram) or row["ig_posted"].strip().lower() == "true"
+        if fb_ok and ig_ok:
+            if row["posted"].strip().lower() != "true":
+                row["posted"] = "True"
+                made_a_change = True
         else:
-            log("  One or more platforms failed -- leaving marked as NOT posted so it retries next run.")
+            log("  Row not fully posted yet -- leaving posted=False so remaining platform(s) retry next run.")
 
-    if made_a_post:
+    if made_a_change:
         with open(SCHEDULE_CSV, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
