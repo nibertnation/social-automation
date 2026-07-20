@@ -34,8 +34,11 @@ import os
 import sys
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo
 
 import requests
+
+EASTERN = ZoneInfo("America/New_York")
 
 # Try to read credentials from environment variables first (this is how
 # GitHub Actions provides the Secrets you configured). If they're not set
@@ -212,7 +215,7 @@ def run():
 
     check_token_expiry()
 
-    now = datetime.now()
+    now = datetime.now(EASTERN).replace(tzinfo=None)
     rows = []
     made_a_change = False
 
